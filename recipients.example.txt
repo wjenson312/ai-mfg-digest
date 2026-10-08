@@ -1,0 +1,9 @@
+# One email address per line. Lines starting with # are ignored, so you can
+# park someone here without removing them:
+#
+#   jordan@example.com      # asked to pause until spring
+#
+# Everyone in this file goes into Bcc, so nobody sees anyone else's address.
+# Copy this to recipients.txt and add your list.
+
+you@example.com

@@ -1,0 +1,118 @@
+name: Weekly Digest
+
+# ---------------------------------------------------------------------------
+# TIMEZONE NOTE
+# GitHub Actions cron is ALWAYS UTC and does not follow daylight saving. A
+# single schedule would drift by an hour twice a year.
+#
+# So we fire twice -- 15:00 UTC (= 10am CDT, summer) and 16:00 UTC (= 10am CST,
+# winter) -- and the "Should this run?" step below exits the run unless it is
+# actually 10am in America/Chicago. Exactly one of the two fires each week.
+#
+# Change TARGET_TZ and TARGET_HOUR below if you move or want a different time.
+# ---------------------------------------------------------------------------
+
+on:
+  schedule:
+    - cron: "0 15 * * 2"   # Tuesday 10:00 CDT
+    - cron: "0 16 * * 2"   # Tuesday 10:00 CST
+  workflow_dispatch:       # adds a "Run workflow" button for manual testing
+    inputs:
+      mode:
+        description: "What to do"
+        required: true
+        default: dry-run
+        type: choice
+        options:
+          - dry-run        # collect sources only. No model calls, no email, $0
+          - preview        # write the digest, show the email, do NOT send
+          - send           # write the digest AND email the list
+      days:
+        description: "Lookback window in days"
+        required: false
+        default: "7"
+
+env:
+  TARGET_TZ: America/Chicago
+  TARGET_HOUR: "10"
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25          # the collect stage sleeps between arXiv calls
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # Both cron entries fire every week; only one of them is 10am locally.
+      - name: Should this run?
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "Manual run -- skipping the time check."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LOCAL_HOUR=$(TZ="$TARGET_TZ" date +%H)
+          LOCAL_TIME=$(TZ="$TARGET_TZ" date '+%Y-%m-%d %H:%M %Z')
+          echo "Local time in $TARGET_TZ is $LOCAL_TIME"
+          if [ "$LOCAL_HOUR" = "$TARGET_HOUR" ]; then
+            echo "That's the target hour. Proceeding."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Not $TARGET_HOUR:00 locally -- this is the other DST schedule. Skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.gate.outputs.proceed == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run the digest
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          # --- secrets (Settings -> Secrets and variables -> Actions) ---
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SMTP_USER:         ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD:     ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_RECIPIENTS:  ${{ secrets.EMAIL_RECIPIENTS }}
+          EMAIL_REPLY_TO:    ${{ secrets.SMTP_USER }}
+          EMAIL_UNSUBSCRIBE: ${{ secrets.SMTP_USER }}
+          # --- non-secret config ---
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: "587"
+          SMTP_SECURITY: starttls
+          EMAIL_FROM_NAME: AI x Manufacturing Digest
+          EMAIL_SUBJECT_PREFIX: "[AI x Mfg]"
+          EMAIL_FOOTER: "You're getting this because you asked for a weekly roundup of AI research that touches manufacturing. Written by an automated scout, reviewed before sending."
+          DIGEST_BUDGET_USD: "2.00"
+        run: |
+          MODE="${{ github.event.inputs.mode || 'send' }}"
+          DAYS="${{ github.event.inputs.days || '7' }}"
+          echo "Mode: $MODE   Lookback: $DAYS days"
+          case "$MODE" in
+            dry-run) python digest_agent.py --dry-run --days "$DAYS" ;;
+            preview) python digest_agent.py --days "$DAYS" ;;
+            send)    python digest_agent.py --days "$DAYS" --send ;;
+            *)       echo "Unknown mode: $MODE" && exit 1 ;;
+          esac
+
+      # Keeps a copy of every issue even though digest_*.md is gitignored.
+      - name: Save the digest
+        if: steps.gate.outputs.proceed == 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ github.run_number }}
+          path: digest_*.md
+          retention-days: 90
+          if-no-files-found: ignore

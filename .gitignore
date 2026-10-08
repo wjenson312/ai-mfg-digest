@@ -1,0 +1,17 @@
+# Secrets -- never commit these
+.env
+
+# Your actual mailing list
+recipients.txt
+
+# Output
+digest_*.md
+!digest_2026-10-05.md
+run.log
+__pycache__/
+*.pyc
+.python_path
+schedule.log
+.env.bak
+.env.*
+!.env.example
