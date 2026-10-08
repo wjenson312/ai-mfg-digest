@@ -70,7 +70,7 @@ SUBJECT: A model that watches the weld pool     ← the mailer strips this line
 **The short version**          ← 4 bullets, the whole week
 ## What happened in AI this week    ← plain language, no factory angle yet
 ## Why a factory should care        ← the connections, plus what to ignore
-## Worth a closer look              ← 8 research items
+## Digging deeper                   ← 8 research items
      What's new. / On the floor. / The catch.
 ## One thing to watch
 ```
@@ -118,6 +118,112 @@ sounds: a scheduled job doesn't inherit your shell's PATH, and the system
 `/usr/bin/python3` does **not** have these packages installed. `install_schedule.sh`
 records the correct interpreter in `.python_path`, and the runner checks the
 imports before doing anything.
+
+---
+
+## Running it on GitHub Actions
+
+Runs in the cloud, so your Mac doesn't need to be awake on Tuesday morning.
+
+### 1. Create the repository
+
+**Make it private.** The code is harmless, but the digests and your config
+history don't need to be public, and private repos get 2,000 free Actions
+minutes a month — this job uses about 5.
+
+```bash
+gh repo create ai-mfg-digest --private --source=. --remote=origin --push
+```
+
+Or create it on github.com and then:
+
+```bash
+git remote add origin https://github.com/YOUR-USERNAME/ai-mfg-digest.git
+git push -u origin main
+```
+
+### 2. Add the four secrets
+
+**Settings → Secrets and variables → Actions → New repository secret.**
+
+| Secret | Value |
+|---|---|
+| `ANTHROPIC_API_KEY` | Your `sk-ant-...` key |
+| `SMTP_USER` | `williamjenson121@gmail.com` |
+| `SMTP_PASSWORD` | The 16-character Gmail app password |
+| `EMAIL_RECIPIENTS` | Comma-separated list of subscribers |
+
+The recipient list is a secret, not a config value — those are other people's
+addresses and they shouldn't sit in a repo. The workflow reuses `SMTP_USER` for
+reply-to and unsubscribe, so there's nothing else to set.
+
+Everything non-secret (host, port, sender name, subject prefix, footer) is in
+the workflow file itself, where you can read and edit it.
+
+### 3. Test before trusting it
+
+**Actions → Weekly Digest → Run workflow.** Pick a mode:
+
+| Mode | Does | Costs |
+|---|---|---|
+| `dry-run` | Hits every source, lists what it found. No model calls, no email. | $0 |
+| `preview` | Writes the digest, shows the email, sends nothing. | ~$0.30 |
+| `send` | Writes it and emails the list. | ~$0.30 |
+
+Run `dry-run` first. If it finds a few hundred items, your network path works.
+Then `preview`. Then `send` once you're happy.
+
+Every run uploads the digest as a downloadable artifact, kept 90 days — so you
+have an archive even though `digest_*.md` is gitignored.
+
+### Why there are two cron schedules
+
+GitHub Actions cron is **always UTC and ignores daylight saving**, so a single
+schedule drifts by an hour twice a year. The workflow fires at both 15:00 UTC
+(10am CDT) and 16:00 UTC (10am CST), and the first step checks the real local
+time in `America/Chicago` and stops the run unless it's 10am. Exactly one of the
+two proceeds each week; the other exits in about three seconds.
+
+To change the time or timezone, edit `TARGET_TZ` and `TARGET_HOUR` at the top of
+the workflow, and move both cron lines to match.
+
+### Things that will bite you eventually
+
+- **GitHub disables scheduled workflows after 60 days of no repo activity.** You
+  get an email warning first. Any push or a manual run resets the clock — easy to
+  miss if the thing runs itself perfectly for two months.
+- **Scheduled runs are not punctual.** GitHub queues them during busy periods;
+  5–20 minutes late is normal, and under heavy load a run can be dropped. Fine
+  for a newsletter, not for anything time-critical.
+- **A failed run emails you** by default (GitHub's own notification), so a silent
+  Tuesday still reaches you.
+- **Rotating the Gmail app password** means updating the `SMTP_PASSWORD` secret
+  too. The local `.env` and the GitHub secret are separate copies.
+
+### Local scheduling vs. Actions
+
+You now have both. Run one, not both, or subscribers get two copies.
+
+If you installed the launchd job earlier, remove it before enabling Actions:
+
+```bash
+launchctl bootout gui/$(id -u)/com.aimfgdigest.weekly
+```
+
+---
+
+## Keeping secrets out of the repository
+
+A `pre-commit` hook in `.githooks/` blocks any commit containing something
+shaped like an API key, or a tracked `.env`-style file with filled-in values.
+It's already active (`git config core.hooksPath .githooks`).
+
+This exists because a real API key and app password did end up in
+`.env.example` during setup. `.gitignore` does not protect you there — that file
+is *meant* to be committed, just with empty values. The hook catches what
+.gitignore structurally cannot.
+
+Override in an emergency with `git commit --no-verify`.
 
 ---
 
@@ -217,6 +323,9 @@ Verified 2026-10-05. The script handles all of these.
 | `run_weekly.sh` | What the scheduler calls. |
 | `install_schedule.sh` | Installs the Tuesday 10am job. |
 | `com.aimfgdigest.weekly.plist` | The launchd job definition. |
+| `.github/workflows/weekly-digest.yml` | The GitHub Actions schedule. |
+| `requirements.txt` | Pinned dependencies, used by Actions. |
+| `.githooks/pre-commit` | Blocks commits containing secrets. |
 | `email_preview.html` | Last rendered email, openable in a browser. |
 | `digest_2026-10-05.md` | Example issue in the newsletter format. |
 | `run.log` | Scheduled run output. |
