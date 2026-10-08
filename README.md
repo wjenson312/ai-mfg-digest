@@ -316,7 +316,6 @@ Verified 2026-10-05. The script handles all of these.
 
 | File | What |
 |---|---|
-| `HANDOFF.md` | Why things are built this way, and what breaks if you change them. |
 | `digest_agent.py` | Main script: collect, screen, write. |
 | `mailer.py` | Email rendering and SMTP delivery. |
 | `.env.example` | **Copy to `.env` and fill in.** |
