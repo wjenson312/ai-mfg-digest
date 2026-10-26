@@ -944,8 +944,16 @@ def _deliver(body: str, args: argparse.Namespace, generated: bool) -> int:
               f"Fill in .env, then use --check-smtp.)")
         return 0
 
-    mailer.send_digest(cfg, subject, email_body,
-                       recipients=recipients, dry_run=not args.send)
+    delivered = mailer.send_digest(cfg, subject, email_body,
+                                   recipients=recipients, dry_run=not args.send)
+
+    # A send that reached nobody used to exit 0, which made a dead SMTP app
+    # password look exactly like a good week. Say so in the exit code, so the
+    # workflow can raise the alarm instead of recording a marker.
+    if args.send and not delivered:
+        print("\nSend reached 0 recipients -- treating this as a failure.",
+              file=sys.stderr)
+        return 1
     return 0
 
 

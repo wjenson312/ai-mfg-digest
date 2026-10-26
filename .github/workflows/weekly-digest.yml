@@ -1,22 +1,42 @@
 name: Weekly Digest
 
 # ---------------------------------------------------------------------------
-# TIMEZONE NOTE
-# GitHub Actions cron is ALWAYS UTC and does not follow daylight saving. A
-# single schedule would drift by an hour twice a year.
+# WHY THIS LOOKS THE WAY IT DOES
 #
-# So we fire twice -- 15:00 UTC (= 10am CDT, summer) and 16:00 UTC (= 10am CST,
-# winter) -- and the "Should this run?" step below exits the run unless it is
-# actually 10am in America/Chicago. Exactly one of the two fires each week.
+# The first version of this file fired two crons a week (one per US DST offset)
+# and then ran a gate that exited unless the local hour equalled TARGET_HOUR.
+# GitHub delivered four scheduled runs 3-5 hours late; the gate read that
+# lateness as "wrong side of daylight saving" and exited GREEN every time.
+# Four runs, zero emails, nothing red to notice. See README for the evidence.
 #
-# Change TARGET_TZ and TARGET_HOUR below if you move or want a different time.
+# Three things changed:
+#
+#   1. A LADDER, not one chance. GitHub cron is best-effort: late by 10-60+
+#      minutes routinely, silently dropped under load, never retried. Five
+#      rungs spread across the target day give the week five chances.
+#   2. The gate asks only TWO questions -- is it the target weekday in
+#      TARGET_TZ, and has the marker already recorded this cycle? Local weekday
+#      and local date are correct in both halves of the DST year, so all the
+#      DST arithmetic is simply gone. Lateness can no longer cause a skip.
+#   3. Silence is no longer ambiguous. A real send writes state/last_sent; a
+#      failed *scheduled* run mails an alarm; a day that produced nothing at all
+#      gets a catch-up email the next morning.
+#
+# Crons are UTC. Every rung below is annotated with its local time under BOTH
+# offsets, and tests/test_ladder.py pins that -- do not edit a cron without
+# running them.
 # ---------------------------------------------------------------------------
 
 on:
   schedule:
-    - cron: "0 15 * * 2"   # Tuesday 10:00 CDT
-    - cron: "0 16 * * 2"   # Tuesday 10:00 CST
-  workflow_dispatch:       # adds a "Run workflow" button for manual testing
+    # Local times are America/Chicago. CDT = UTC-5 (summer), CST = UTC-6.
+    - cron: "0 15 * * 2"   # rung 1  Tue 10:00 CDT / 09:00 CST  <- preferred hour
+    - cron: "0 16 * * 2"   # rung 2  Tue 11:00 CDT / 10:00 CST
+    - cron: "0 18 * * 2"   # rung 3  Tue 13:00 CDT / 12:00 CST
+    - cron: "0 21 * * 2"   # rung 4  Tue 16:00 CDT / 15:00 CST
+    - cron: "0 1 * * 3"    # rung 5  Tue 20:00 CDT / 19:00 CST  (next UTC day!)
+    - cron: "0 14 * * 3"   # catch-up  Wed 09:00 CDT / 08:00 CST
+  workflow_dispatch:
     inputs:
       mode:
         description: "What to do"
@@ -32,55 +52,160 @@ on:
         required: false
         default: "7"
 
+# Serialise the ladder. Without this, two rungs that arrive together both read
+# the marker before either writes it, and both send. cancel-in-progress MUST
+# stay false: cancelling a rung mid-send is how you get a half-delivered week.
+concurrency:
+  group: weekly-digest
+  cancel-in-progress: false
+
 env:
   TARGET_TZ: America/Chicago
-  TARGET_HOUR: "10"
+  TARGET_DOW: "2"            # 1=Mon .. 7=Sun, as `date +%u` reports it
+  TARGET_HOUR: "10"          # soft preference, consulted by rung 1 only
+  FIRST_RUNG: "0 15 * * 2"
+  CATCHUP_RUNG: "0 14 * * 3"
+  CATCHUP_MAX_AGE_DAYS: "2"  # don't mail a digest for a cycle older than this
+  MARKER_FILE: state/last_sent
 
 jobs:
-  digest:
+  # -------------------------------------------------------------------------
+  # Decide whether this rung should send. Reads the marker, so it needs a
+  # checkout. No Python, no pip, no secrets -- it must be the cheapest and
+  # most reliable job in the file.
+  # -------------------------------------------------------------------------
+  gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 25          # the collect stage sleeps between arXiv calls
-
+    outputs:
+      proceed:    ${{ steps.gate.outputs.proceed }}
+      cycle_date: ${{ steps.gate.outputs.cycle_date }}
+      reason:     ${{ steps.gate.outputs.reason }}
     steps:
-      - name: Check out the repository
-        uses: actions/checkout@v4
+      # ref: matters. On a scheduled event the default checkout pins to the sha
+      # the run was CREATED from, so a rung that sat in the concurrency queue
+      # while an earlier rung pushed the marker would read the pre-marker tree
+      # and send a duplicate. Checking out the branch gets the tip as of now.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
 
-      # Both cron entries fire every week; only one of them is 10am locally.
-      - name: Should this run?
+      - name: Should this rung send?
         id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CRON: ${{ github.event.schedule }}
         run: |
-          if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "Manual run -- skipping the time check."
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          # Runners are UTC. Everything below is deliberately local time.
+          export TZ="$TARGET_TZ"
+
+          today=$(date +%F)
+          dow=$(date +%u)
+          hour=$(date +%H)
+
+          # The cycle is identified by the most recent target weekday on or
+          # before today, in local time. On the target day that is today; on
+          # the catch-up morning it is yesterday. One value, no DST maths.
+          age=$(( (dow - TARGET_DOW + 7) % 7 ))
+          cycle=$(date -d "$today -$age day" +%F)
+
+          # tr strips the trailing newline and any stray whitespace, so a
+          # hand-edited marker file still compares equal.
+          marker=""
+          [ -f "$MARKER_FILE" ] && marker=$(tr -d '[:space:]' < "$MARKER_FILE")
+
+          echo "local now  : $(date '+%Y-%m-%d %H:%M %Z')  (weekday $dow)"
+          echo "cycle      : $cycle  ($age day(s) before today)"
+          echo "marker     : ${marker:-<none>}"
+          echo "event      : $EVENT_NAME   cron: ${CRON:-<none>}"
+
+          emit() {
+            {
+              echo "proceed=$1"
+              echo "cycle_date=$cycle"
+              echo "reason=$2"
+            } >> "$GITHUB_OUTPUT"
+            echo "==> proceed=$1  --  $2"
+          }
+
+          if [ "$EVENT_NAME" != "schedule" ]; then
+            emit true "manual dispatch: the gate never blocks a human"
             exit 0
           fi
-          LOCAL_HOUR=$(TZ="$TARGET_TZ" date +%H)
-          LOCAL_TIME=$(TZ="$TARGET_TZ" date '+%Y-%m-%d %H:%M %Z')
-          echo "Local time in $TARGET_TZ is $LOCAL_TIME"
-          if [ "$LOCAL_HOUR" = "$TARGET_HOUR" ]; then
-            echo "That's the target hour. Proceeding."
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Not $TARGET_HOUR:00 locally -- this is the other DST schedule. Skipping."
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
+
+          # QUESTION 1: has this cycle already been delivered? True on every
+          # rung, which is what makes the ladder safe to fire five times.
+          if [ "$marker" = "$cycle" ]; then
+            emit false "already sent for $cycle"
+            exit 0
           fi
 
-      - name: Set up Python
-        if: steps.gate.outputs.proceed == 'true'
-        uses: actions/setup-python@v5
+          if [ "$CRON" = "$CATCHUP_RUNG" ]; then
+            if [ "$age" -eq 0 ]; then
+              emit false "catch-up landed on the target day; the main ladder owns today"
+              exit 0
+            fi
+            if [ "$age" -gt "$CATCHUP_MAX_AGE_DAYS" ]; then
+              emit false "catch-up too late: $cycle is $age days old"
+              exit 0
+            fi
+            emit true "catch-up: $cycle produced nothing"
+            exit 0
+          fi
+
+          # QUESTION 2: is it the target weekday locally? That is the ONLY
+          # clock question the main ladder is allowed to ask.
+          if [ "$dow" != "$TARGET_DOW" ]; then
+            emit false "not the target weekday in $TARGET_TZ"
+            exit 0
+          fi
+
+          # Soft hour preference. Note the test is "too EARLY", never "not
+          # equal": a late rung always sends. Only rung 1 consults it, so in
+          # winter rung 1 steps aside at 09:00 local and rung 2 sends at 10:00.
+          # Give any later rung an hour check and the silent-week bug is back.
+          if [ "$CRON" = "$FIRST_RUNG" ] && [ "$hour" -lt "$TARGET_HOUR" ]; then
+            emit false "rung 1 ran at ${hour}:00, earlier than the preferred ${TARGET_HOUR}:00 -- a later rung will send"
+            exit 0
+          fi
+
+          emit true "target weekday, nothing recorded for $cycle"
+
+  # -------------------------------------------------------------------------
+  # The actual digest.
+  # -------------------------------------------------------------------------
+  digest:
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25          # the collect stage sleeps between arXiv calls
+    permissions:
+      contents: write            # to push the marker back
+    steps:
+      # Same reason as the gate, plus one more: a sha checkout leaves a detached
+      # HEAD with no upstream, and the marker push below would fail every time.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
-        if: steps.gate.outputs.proceed == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run the digest
-        if: steps.gate.outputs.proceed == 'true'
+        id: run
         env:
+          # Runners are UTC and digest_agent.py names its output from
+          # date.today(). Without this a rung after 19:00 local files the
+          # digest under tomorrow's date.
+          TZ: ${{ env.TARGET_TZ }}
           # --- secrets (Settings -> Secrets and variables -> Actions) ---
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SMTP_USER:         ${{ secrets.SMTP_USER }}
@@ -97,22 +222,159 @@ jobs:
           EMAIL_FOOTER: "You're getting this because you asked for a weekly roundup of AI research that touches manufacturing. Written by an automated scout, reviewed before sending."
           DIGEST_BUDGET_USD: "2.00"
         run: |
+          set -euo pipefail
           MODE="${{ github.event.inputs.mode || 'send' }}"
           DAYS="${{ github.event.inputs.days || '7' }}"
-          echo "Mode: $MODE   Lookback: $DAYS days"
+          echo "Mode: $MODE   Lookback: $DAYS days   Local date: $(date +%F)"
           case "$MODE" in
             dry-run) python digest_agent.py --dry-run --days "$DAYS" ;;
             preview) python digest_agent.py --days "$DAYS" ;;
             send)    python digest_agent.py --days "$DAYS" --send ;;
-            *)       echo "Unknown mode: $MODE" && exit 1 ;;
+            *)       echo "Unknown mode: $MODE" >&2; exit 1 ;;
           esac
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
 
-      # Keeps a copy of every issue even though digest_*.md is gitignored.
+      # always(), because a genuine send followed by a LATER step failing must
+      # still record the marker -- otherwise the next rung mails a duplicate.
+      # Guarded on steps.run.outcome so a crashed pipeline records nothing.
+      - name: Record the send
+        if: always() && steps.run.outcome == 'success' && steps.run.outputs.mode == 'send'
+        env:
+          EMAIL_RECIPIENTS: ${{ secrets.EMAIL_RECIPIENTS }}
+          CYCLE_DATE: ${{ needs.gate.outputs.cycle_date }}
+        run: |
+          set -euo pipefail
+
+          # digest_agent.py's send path refuses to run with an empty recipient
+          # list, but belt and braces: a marker written for a send that reached
+          # nobody would suppress every remaining rung this week.
+          if [ -z "${EMAIL_RECIPIENTS//[[:space:],]/}" ]; then
+            echo "::error::EMAIL_RECIPIENTS is empty -- this run mailed nobody." >&2
+            echo "Refusing to write the marker so a later rung can still deliver." >&2
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "$MARKER_FILE")"
+          echo "$CYCLE_DATE" > "$MARKER_FILE"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$MARKER_FILE"
+          git diff --cached --quiet && { echo "Marker already $CYCLE_DATE."; exit 0; }
+          git commit -m "Digest delivered for $CYCLE_DATE"
+
+          # TRADEOFF, stated plainly: the mail has already gone out. If this
+          # push never lands, a later rung reads a stale marker and sends a
+          # duplicate. That is the failure direction we chose -- a rare
+          # duplicate email beats a silent week.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Marker pushed on attempt $attempt."
+              exit 0
+            fi
+            echo "Push failed (attempt $attempt); rebasing onto origin and retrying."
+            git pull --rebase --autostash || true
+            sleep $(( attempt * 5 ))
+          done
+
+          echo "::error::Mail was SENT for $CYCLE_DATE but the marker could not be pushed." >&2
+          echo "::error::A later rung may send a duplicate. Fix by hand: echo $CYCLE_DATE > $MARKER_FILE" >&2
+          exit 1
+
       - name: Save the digest
-        if: steps.gate.outputs.proceed == 'true' && always()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: digest-${{ github.run_number }}
           path: digest_*.md
           retention-days: 90
           if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # A red run in a tab nobody opens is not a notification. If a SCHEDULED run
+  # fails, say so in the inbox. Deliberately dependency-light: stdlib smtplib
+  # on the runner's preinstalled python3, no checkout, no pip. This job has to
+  # work on the day everything else didn't.
+  # -------------------------------------------------------------------------
+  alarm:
+    needs: [gate, digest]
+    if: always() && github.event_name == 'schedule' && (needs.gate.result == 'failure' || needs.digest.result == 'failure')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mail the alarm
+        env:
+          SMTP_USER:     ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALARM_TO:      ${{ secrets.SMTP_USER }}
+          CRON:          ${{ github.event.schedule }}
+          RUN_URL:       ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO:          ${{ github.repository }}
+          GATE_RESULT:   ${{ needs.gate.result }}
+          DIGEST_RESULT: ${{ needs.digest.result }}
+          CYCLE_DATE:    ${{ needs.gate.outputs.cycle_date }}
+        run: |
+          python3 - <<'PY'
+          import os, smtplib, ssl
+          from email.message import EmailMessage
+
+          g = os.environ.get
+          to = (g("ALARM_TO") or "").strip()
+          user, pw = (g("SMTP_USER") or "").strip(), (g("SMTP_PASSWORD") or "")
+          if not (to and user and pw):
+              raise SystemExit("SMTP not configured -- cannot raise the alarm.")
+
+          fired = g("CRON") or "(unknown)"
+          # Which rungs are still to come after the one that just failed.
+          ladder = ["0 15 * * 2", "0 16 * * 2", "0 18 * * 2",
+                    "0 21 * * 2", "0 1 * * 3", "0 14 * * 3"]
+          local = {"0 15 * * 2": "Tue 10:00 CDT / 09:00 CST",
+                   "0 16 * * 2": "Tue 11:00 CDT / 10:00 CST",
+                   "0 18 * * 2": "Tue 13:00 CDT / 12:00 CST",
+                   "0 21 * * 2": "Tue 16:00 CDT / 15:00 CST",
+                   "0 1 * * 3":  "Tue 20:00 CDT / 19:00 CST",
+                   "0 14 * * 3": "Wed 09:00 CDT / 08:00 CST (catch-up)"}
+          rest = ladder[ladder.index(fired) + 1:] if fired in ladder else ladder
+          nxt = ("\n".join(f"  - {c:<12} {local.get(c, '')}" for c in rest)
+                 or "  - nothing: that was the last rung for this cycle.")
+
+          # Built as a list of lines on purpose: this script is a heredoc
+          # inside a YAML block scalar, and any dedent that assumes a fixed
+          # indent width breaks the moment the YAML indentation shifts.
+          body = "\n".join([
+              "The weekly digest failed on a scheduled run.",
+              "",
+              f"Cycle date : {g('CYCLE_DATE') or '(gate did not report one)'}",
+              f"Cron fired : {fired}  ({local.get(fired, 'not a known rung')})",
+              f"gate job   : {g('GATE_RESULT')}",
+              f"digest job : {g('DIGEST_RESULT')}",
+              f"Run log    : {g('RUN_URL')}",
+              "",
+              "The ladder will still try:",
+              nxt,
+              "",
+              "No marker was written, so any of those rungs can still deliver.",
+              "If none do, the Wednesday catch-up rung fires, because the marker",
+              "will not hold this cycle's date.",
+              "",
+              "To send it by hand right now:",
+              "",
+              f"  gh workflow run weekly-digest.yml --repo {g('REPO')} \\",
+              "       -f mode=send -f days=7",
+              "",
+              "Common causes, in the order they bite: a revoked SMTP app",
+              "password, an exhausted DIGEST_BUDGET_USD, an expired",
+              "ANTHROPIC_API_KEY, or a source site changing its markup.",
+              "",
+          ])
+
+          m = EmailMessage()
+          m["Subject"] = f"[AI x Mfg] ALARM: scheduled digest failed ({fired})"
+          m["From"], m["To"] = user, to
+          m.set_content(body)
+
+          with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
+              s.starttls(context=ssl.create_default_context())
+              s.login(user, pw)
+              s.send_message(m)
+          print(f"Alarm mailed to {to}.")
+          PY

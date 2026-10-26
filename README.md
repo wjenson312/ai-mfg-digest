@@ -176,29 +176,165 @@ Then `preview`. Then `send` once you're happy.
 Every run uploads the digest as a downloadable artifact, kept 90 days — so you
 have an archive even though `digest_*.md` is gitignored.
 
-### Why there are two cron schedules
+### The delivery ladder, and the silent weeks that caused it
 
-GitHub Actions cron is **always UTC and ignores daylight saving**, so a single
-schedule drifts by an hour twice a year. The workflow fires at both 15:00 UTC
-(10am CDT) and 16:00 UTC (10am CST), and the first step checks the real local
-time in `America/Chicago` and stops the run unless it's 10am. Exactly one of the
-two proceeds each week; the other exits in about three seconds.
+**What went wrong.** The first version of the workflow fired two crons a week —
+15:00 UTC (10am CDT) and 16:00 UTC (10am CST) — and a gate step exited unless
+the local hour in `America/Chicago` was exactly 10. That gate assumed the only
+reason a run could see a non-10am clock was daylight saving.
 
-To change the time or timezone, edit `TARGET_TZ` and `TARGET_HOUR` at the top of
-the workflow, and move both cron lines to match.
+It isn't. GitHub cron is best-effort. Four scheduled runs actually executed:
+
+| Scheduled | Actually ran | Local time the gate saw | Outcome |
+|---|---|---|---|
+| 15:00 UTC Tue 2026-10-13 | 20:27 UTC | 15:27 CDT | skipped, green |
+| 16:00 UTC Tue 2026-10-13 | 20:51 UTC | 15:51 CDT | skipped, green |
+| 15:00 UTC Tue 2026-10-20 | 18:50 UTC | 13:50 CDT | skipped, green |
+| 16:00 UTC Tue 2026-10-20 | 19:39 UTC | 14:39 CDT | skipped, green |
+
+Every one was hours late, so every one read as "the other DST schedule" and
+exited **successfully**. Four runs, zero emails, nothing red in the Actions tab
+and nothing missing in the inbox but the digest itself.
+
+**What replaced it.** Three changes, because the single cron, the wall-clock
+gate, and the indistinguishability of failure from success were three separate
+faults:
+
+**1. A retry ladder.** Six cron lines instead of two. Crons are UTC, so each is
+annotated with its local time under *both* offsets — note that a late-evening
+local rung is the **next** UTC day:
+
+| Cron (UTC) | CDT (summer) | CST (winter) | Role |
+|---|---|---|---|
+| `0 15 * * 2` | Tue 10:00 | Tue 09:00 | rung 1, consults the preferred hour |
+| `0 16 * * 2` | Tue 11:00 | Tue 10:00 | rung 2 |
+| `0 18 * * 2` | Tue 13:00 | Tue 12:00 | rung 3 |
+| `0 21 * * 2` | Tue 16:00 | Tue 15:00 | rung 4 |
+| `0 1 * * 3`  | Tue 20:00 | Tue 19:00 | rung 5 |
+| `0 14 * * 3` | Wed 09:00 | Wed 08:00 | catch-up |
+
+**2. A gate that asks two questions, not one.** Is it the target weekday in
+`TARGET_TZ`, and does `state/last_sent` already hold this cycle's local date?
+Both are correct in either half of the DST year, so *all* the DST arithmetic is
+gone — that is why two cron lines paired with an hour check are no longer
+needed. Lateness can no longer cause a skip.
+
+The intended hour survives only as a **soft preference**, and only rung 1
+consults it, as "is it too *early*" rather than "is it the wrong hour". In
+winter rung 1 steps aside at 09:00 local and rung 2 sends at 10:00. Give any
+later rung an hour check and the silent week is back.
+
+**3. `state/last_sent`, an idempotency marker.** One line holding the local date
+of the last genuine send, committed and pushed back to the repo — which is why
+the gate job needs a checkout. Written **only** after a real send: never on a
+dry-run or preview, and never by a `--test-email` deliverability check, because
+writing it during a test on a Tuesday would suppress that Tuesday's real
+digest.
+
+**4. A catch-up rung** the next morning, which fires only when the marker does
+not hold the target day's date. A totally failed Tuesday costs a late email
+rather than a missing one. It records *Tuesday's* date, not Wednesday's, so a
+repeated catch-up firing is idempotent too.
+
+**5. An alarm.** When a **scheduled** run fails, a plain-text email names the
+cron that fired, the run URL, which rungs the ladder will still try, and the
+manual-dispatch command. It uses stdlib `smtplib` on the runner's preinstalled
+`python3` — no checkout, no `pip` — because it has to work on the day
+everything else didn't. It is gated on `always() && github.event_name ==
+'schedule' && ...result == 'failure'`, so a failed manual run mails nobody.
+
+To change the time or timezone, edit `TARGET_TZ`, `TARGET_DOW` and
+`TARGET_HOUR` in the workflow's `env:` block, move every cron line, and run
+`python3 -m pytest tests/` — the tests fail if a rung lands on the wrong local
+weekday in either half of the year.
+
+### Deliberate tradeoffs
+
+- **A rare duplicate beats a silent week.** The marker is pushed *after* the
+  mail has gone out. The push is retried five times with
+  `git pull --rebase --autostash` in between, but if it never lands, a later
+  rung reads a stale marker and sends a second copy. With retries you have to
+  pick a failure direction, and this is the one that keeps subscribers served.
+- **The marker step runs under `always()`** so a run that mailed successfully
+  still records the send when a *later* step fails — otherwise the next rung
+  mails a duplicate. It is still guarded on the pipeline step's own outcome, so
+  a crashed run records nothing.
+- **Workflow-level `concurrency` with `cancel-in-progress: false`** serialises
+  the ladder, so a queued rung's gate runs only after the previous rung has
+  pushed its marker. Without it, two rungs that arrive together both read an
+  empty marker and both send. It must not cancel: cancelling a rung mid-send is
+  how you get a half-delivered week.
+- **`TZ: America/Chicago` on the pipeline step.** Runners are UTC and
+  `digest_agent.py` names its output from `date.today()`. Without this, rung 5
+  (20:00 local) files the digest under tomorrow's date.
 
 ### Things that will bite you eventually
 
 - **GitHub disables scheduled workflows after 60 days of no repo activity.** You
   get an email warning first. Any push or a manual run resets the clock — easy to
-  miss if the thing runs itself perfectly for two months.
-- **Scheduled runs are not punctual.** GitHub queues them during busy periods;
-  5–20 minutes late is normal, and under heavy load a run can be dropped. Fine
-  for a newsletter, not for anything time-critical.
-- **A failed run emails you** by default (GitHub's own notification), so a silent
-  Tuesday still reaches you.
+  miss if the thing runs itself perfectly for two months. The marker commit each
+  week now counts as activity, so this largely takes care of itself.
+- **Scheduled runs are not punctual, and are sometimes dropped entirely.**
+  10–60+ minutes late is routine; deliveries seven hours late happen during
+  Actions incidents; and under load a firing is dropped with no run, no retry
+  and no notification. That is what the ladder is for.
+- **Do not trust "a failed run emails you".** GitHub's own notification only
+  fires on a *red* run, and the original bug produced four green ones. A red run
+  in a tab nobody opens is not a notification either — hence the alarm job.
 - **Rotating the Gmail app password** means updating the `SMTP_PASSWORD` secret
-  too. The local `.env` and the GitHub secret are separate copies.
+  too. The local `.env` and the GitHub secret are separate copies. A revoked app
+  password now fails the run loudly instead of mailing nobody quietly.
+
+### Diagnosing a missing digest
+
+Work in this order; the first question rules out most of the rest.
+
+```bash
+# 1. Did a run even exist? If total_count is 0, GitHub never delivered the
+#    event -- the problem is not your gate, your pipeline or SMTP.
+gh api "repos/OWNER/REPO/actions/runs?event=schedule" --jq .total_count
+
+#    If zero, check these before theorising:
+gh api repos/OWNER/REPO/actions/workflows --jq '.workflows[] | {name, state}'
+gh api repos/OWNER/REPO/actions/permissions      # enabled: true?
+gh api repos/OWNER/REPO --jq .default_branch     # the file must be on it
+
+# 2. An Actions incident? "Queueing new Actions runs" being degraded is a real
+#    and common cause of a dropped or hours-late cron.
+curl -s https://www.githubstatus.com/api/v2/incidents/unresolved.json
+
+# 3. A run existed but no mail arrived? Read the GATE log before blaming the
+#    mailer -- it prints the local time, the cycle date and the marker.
+gh run view RUN_ID --log | grep -A2 "local now"
+
+# 4. Send it by hand.
+gh workflow run weekly-digest.yml -f mode=send -f days=7
+```
+
+`on:` parses as the YAML 1.1 boolean key `True`. That is normal, not the bug.
+
+### Testing the schedule
+
+`tests/` does not mock the gate — `tests/gate_harness.py` extracts the real
+`run:` script out of the workflow YAML, substitutes the `${{ }}` expressions,
+puts a stub `date` early on `PATH`, and executes the shipped bash. Editing the
+gate changes what the tests run.
+
+```bash
+python3 -m pip install pytest pyyaml
+python3 -m pytest tests/ -q
+```
+
+`tests/test_gate.py` covers the decision table: on time; hours late; the early
+rung in the other DST half; already-sent-today; the last rung of the day;
+catch-up when the day succeeded and when it produced nothing; a stale marker
+from last week; a marker with trailing whitespace; and a wrong weekday.
+
+`tests/test_ladder.py` pins the ladder's invariants in **both** DST halves:
+every rung lands on the target local weekday, the happy path sends exactly one
+email at the target hour, lateness of up to seven hours never causes a skip,
+dropping any single rung (or all but the last) still delivers exactly once, and
+the catch-up fires only when the target day produced nothing.
 
 ### Local scheduling vs. Actions
 
@@ -323,7 +459,11 @@ Verified 2026-10-05. The script handles all of these.
 | `run_weekly.sh` | What the scheduler calls. |
 | `install_schedule.sh` | Installs the Tuesday 10am job. |
 | `com.aimfgdigest.weekly.plist` | The launchd job definition. |
-| `.github/workflows/weekly-digest.yml` | The GitHub Actions schedule. |
+| `.github/workflows/weekly-digest.yml` | The GitHub Actions cron ladder, gate and alarm. |
+| `state/last_sent` | Local date of the last genuine send. The idempotency marker. |
+| `tests/gate_harness.py` | Runs the real gate script from the YAML against a stubbed clock. |
+| `tests/test_gate.py` | The gate's decision table. |
+| `tests/test_ladder.py` | Ladder invariants, pinned in both DST halves. |
 | `requirements.txt` | Pinned dependencies, used by Actions. |
 | `.githooks/pre-commit` | Blocks commits containing secrets. |
 | `email_preview.html` | Last rendered email, openable in a browser. |

@@ -18,3 +18,6 @@ schedule.log
 
 # Local notes, not for the repo
 HANDOFF.md
+
+# macOS
+.DS_Store
