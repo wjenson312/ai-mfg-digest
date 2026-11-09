@@ -110,7 +110,7 @@ silent Tuesday doesn't go unnoticed.
 **If you prefer cron**, the equivalent line is:
 
 ```
-0 10 * * 2 /Users/williamjenson/Desktop/Projects/ai-mfg-digest/run_weekly.sh
+0 10 * * 2 /path/to/ai-mfg-digest/run_weekly.sh
 ```
 
 `run_weekly.sh` pins the right Python interpreter. This matters more than it
@@ -149,7 +149,7 @@ git push -u origin main
 | Secret | Value |
 |---|---|
 | `ANTHROPIC_API_KEY` | Your `sk-ant-...` key |
-| `SMTP_USER` | `williamjenson121@gmail.com` |
+| `SMTP_USER` | Your Gmail address (e.g. `you@gmail.com`) |
 | `SMTP_PASSWORD` | The 16-character Gmail app password |
 | `EMAIL_RECIPIENTS` | Comma-separated list of subscribers |
 
